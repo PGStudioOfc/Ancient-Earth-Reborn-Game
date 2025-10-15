@@ -1,4 +1,4 @@
-name: RDP-46h
+name: RDP
 
 on:
   workflow_dispatch:
@@ -11,10 +11,11 @@ jobs:
 
     steps:
       - name: 🧹 Limpar espaço e preparar o sistema
+        shell: pwsh
         run: |
           Write-Host "==== Limpando arquivos inúteis ===="
-          Stop-Service -Name wuauserv -ErrorAction SilentlyContinue
-          Stop-Service -Name bits -ErrorAction SilentlyContinue
+          Stop-Service -Name wuauserv -Force -ErrorAction SilentlyContinue
+          Stop-Service -Name bits -Force -ErrorAction SilentlyContinue
 
           $paths = @(
             "C:\Program Files (x86)\Microsoft Visual Studio",
@@ -28,7 +29,12 @@ jobs:
 
           foreach ($p in $paths) {
               if (Test-Path $p) {
-                  Remove-Item -Recurse -Force $p -ErrorAction SilentlyContinue
+                  try {
+                    Remove-Item -Path $p -Recurse -Force -ErrorAction Stop
+                    Write-Host "Removido: $p"
+                  } catch {
+                    Write-Warning "Falha ao remover $p — pulando: $_"
+                  }
               }
           }
 
@@ -36,47 +42,88 @@ jobs:
           vssadmin delete shadows /all /quiet
           wevtutil cl System
           wevtutil cl Application
-          Clear-RecycleBin -Force -ErrorAction SilentlyContinue
-          Write-Host "Espaço livre atual (C:):"
-          Get-PSDrive C
+          # Limpa Lixeira (pode requerer permissões elevadas)
+          try {
+            Clear-RecycleBin -Force -ErrorAction Stop
+          } catch {
+            Write-Warning "Não foi possível limpar a lixeira: $_"
+          }
+
+          # Mostrar espaço livre em C:
+          $c = Get-PSDrive -Name C
+          Write-Host "Espaço livre atual (C:) - Free: $($c.Free)  Used: $($c.Used)  Total: $($c.Used + $c.Free)"
 
       - name: ⚙️ Ativar RDP
+        shell: pwsh
         run: |
+          # Habilita RDP, desativa NLA (se necessário) e abre firewall
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
           netsh advfirewall firewall add rule name="RDP-Allow" dir=in action=allow protocol=TCP localport=3389
-          Restart-Service -Name TermService -Force
+          Restart-Service -Name TermService -Force -ErrorAction SilentlyContinue
 
       - name: 👤 Criar usuário RDP
+        shell: pwsh
         run: |
-          Add-Type -AssemblyName System.Security
-          $chars = ([char[]](33..126))
+          # Gera senha segura aleatória
+          $chars = [char[]](33..126)
           $password = -join ((1..18) | ForEach-Object { $chars | Get-Random })
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -Description "Conta de Acesso RDP"
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+          # Cria usuário local e adiciona aos grupos
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -Description "Conta de Acesso RDP"
+          } else {
+            Write-Host "Usuário RDP já existe — atualizando senha."
+            Set-LocalUser -Name "RDP" -Password $securePass
+          }
+
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+
+          # Exporta pro GITHUB_ENV de forma segura
+          Add-Content -Path $env:GITHUB_ENV -Value "RDP_PASSWORD=$password"
 
       - name: 🌐 Instalar Tailscale (para conectar)
+        shell: pwsh
+        env:
+          # garante que GitHub faça a substituição do secret antes do passo rodar
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
+          if (-not $env:TAILSCALE_AUTH_KEY) {
+            Write-Error "Secret TAILSCALE_AUTH_KEY não encontrado. Adicione-o nas configurações do repositório."
+            exit 1
+          }
+
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
+          $installerPath = Join-Path $env:TEMP "tailscale.msi"
+
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=rdp-46h-$env:GITHUB_RUN_ID
-          $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
 
-      - name: 🔄 Manter RDP ativo
+          $tsExe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+          if (-not (Test-Path $tsExe)) {
+            Write-Error "Tailscale não encontrado em $tsExe"
+            exit 1
+          }
+
+          # Substitui a expansão de variável do PowerShell de maneira segura para hostname
+          & $tsExe up --authkey "${env:TAILSCALE_AUTH_KEY}" --hostname "rdp-46h-$($env:GITHUB_RUN_ID)"
+          $tsIP = (& $tsExe ip -4) -join "`n"
+          $tsIP = $tsIP.Trim()
+          Add-Content -Path $env:GITHUB_ENV -Value "TAILSCALE_IP=$tsIP"
+
+      - name: 🔄 Manter RDP ativo (loop — será encerrado quando o job expirar)
+        shell: pwsh
         run: |
           Write-Host "`n=== RDP ATIVO ==="
           Write-Host "IP (Tailscale): $env:TAILSCALE_IP"
           Write-Host "Usuário: RDP"
           Write-Host "Senha: $env:RDP_PASSWORD"
           Write-Host "=================`n"
+          # Loop que mantém o job ativo até o timeout do job (timeout-minutes)
           while ($true) {
-              Write-Host "[$(Get-Date)] RDP ativo — aguardando até 46 horas..."
+              Write-Host "[$(Get-Date -Format o)] RDP ativo — próximo check em 5 minutos..."
               Start-Sleep -Seconds 300
           }
