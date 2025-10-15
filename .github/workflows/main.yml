@@ -1,145 +1,82 @@
-name: RDP
+name: RDP-46h
 
 on:
   workflow_dispatch:
 
 jobs:
   secure-rdp:
-    # 4320 minutos = 72 horas (apenas para self-hosted runners)
-    runs-on: [self-hosted, windows, rdp]
-    timeout-minutes: 4320
+    # 2760 minutos = 46 horas
+    runs-on: windows-latest
+    timeout-minutes: 2760
 
     steps:
-      - name: 🔥 Limpeza Profunda do Sistema (preparar disco para jogos)
+      - name: 🧹 Limpar espaço e preparar o sistema
         run: |
-          Write-Host "==== Iniciando limpeza profunda ===="
-          # Parar serviços que podem travar arquivos
+          Write-Host "==== Limpando arquivos inúteis ===="
           Stop-Service -Name wuauserv -ErrorAction SilentlyContinue
           Stop-Service -Name bits -ErrorAction SilentlyContinue
 
           $paths = @(
             "C:\Program Files (x86)\Microsoft Visual Studio",
             "C:\Program Files\Microsoft Visual Studio",
-            "C:\Program Files (x86)\Android",
-            "C:\Program Files\Android",
             "C:\ProgramData\chocolatey",
             "C:\Program Files\dotnet",
             "C:\hostedtoolcache",
             "C:\Users\runneradmin\AppData\Local\Temp",
-            "C:\Users\runneradmin\AppData\Local\Android",
-            "C:\Users\runneradmin\AppData\Local\NuGet",
-            "C:\Users\runneradmin\AppData\Roaming\npm",
-            "C:\Users\Public\Downloads"
+            "C:\Users\runneradmin\AppData\Roaming\npm"
           )
 
           foreach ($p in $paths) {
               if (Test-Path $p) {
-                  Write-Host "Removendo $p ..."
                   Remove-Item -Recurse -Force $p -ErrorAction SilentlyContinue
               }
           }
 
-          # Limpar pontos de restauração, hibernação e reduzir arquivos de paginação (opcional)
-          Write-Host "Desativando hibernação e limpando pontos de restauração..."
           powercfg -h off
           vssadmin delete shadows /all /quiet
-
-          # Truncar logs grandes (event logs)
-          wevtutil cl System || Write-Host "Não foi possível limpar System log"
-          wevtutil cl Application || Write-Host "Não foi possível limpar Application log"
-
-          # Liberar espaço no Windows temp + Recycle Bin
-          Remove-Item -Recurse -Force "$env:TEMP\*" -ErrorAction SilentlyContinue
+          wevtutil cl System
+          wevtutil cl Application
           Clear-RecycleBin -Force -ErrorAction SilentlyContinue
-
           Write-Host "Espaço livre atual (C:):"
           Get-PSDrive C
 
-          Write-Host "==== Limpeza concluída ===="
-
-      - name: ⚙️ Configurar RDP
+      - name: ⚙️ Ativar RDP
         run: |
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
-          netsh advfirewall firewall delete rule name="RDP-Allow" > $null 2>&1
           netsh advfirewall firewall add rule name="RDP-Allow" dir=in action=allow protocol=TCP localport=3389
-
           Restart-Service -Name TermService -Force
 
-      - name: 👤 Criar usuário RDP com senha segura
+      - name: 👤 Criar usuário RDP
         run: |
           Add-Type -AssemblyName System.Security
           $chars = ([char[]](33..126))
-          $password = -join ((1..20) | ForEach-Object { $chars | Get-Random })
+          $password = -join ((1..18) | ForEach-Object { $chars | Get-Random })
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
-              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -Description "Conta RDP para jogos"
-          } else {
-              Write-Host "Usuário RDP já existe — atualizando senha..."
-              $user = Get-LocalUser -Name "RDP"
-              $user | Set-LocalUser -Password $securePass
-          }
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -Description "Conta de Acesso RDP"
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
           echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
 
-      - name: 🌀 Instalar Tailscale (opcional)
+      - name: 🌐 Instalar Tailscale (para conectar)
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=rdp-46h-$env:GITHUB_RUN_ID
+          $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
-      - name: 🌐 Conectar ao Tailscale (se usar)
+      - name: 🔄 Manter RDP ativo
         run: |
-          if (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe") {
-              & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=rdp-selfhost-$env:GITHUB_RUN_ID
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-          } else {
-              Write-Host "Tailscale não encontrado — pulei essa etapa."
-          }
-
-      - name: ℹ️ Mostrar info de acesso
-        run: |
-          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "`n=== RDP ATIVO ==="
           Write-Host "IP (Tailscale): $env:TAILSCALE_IP"
           Write-Host "Usuário: RDP"
           Write-Host "Senha: $env:RDP_PASSWORD"
-          Write-Host "==================`n"
-
-          # Mantém o job vivo até o timeout do workflow (4320 min)
+          Write-Host "=================`n"
           while ($true) {
-              Write-Host "[$(Get-Date)] Sessão RDP ativa — aguardando 72h..."
-              Start-Sleep -Seconds 300
-          }          if (-not $tsIP) {
-              Write-Error "Falha ao obter IP do Tailscale"
-              exit 1
-          }
-
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-
-      - name: Verificar acessibilidade RDP
-        run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "Conexão TCP na porta 3389 falhou"
-              exit 1
-          }
-          Write-Host "Conectividade TCP bem-sucedida!"
-
-      - name: Manter conexão ativa
-        run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $env:RDP_CREDS"
-          Write-Host "==================`n"
-
-          while ($true) {
-              Write-Host "[$(Get-Date)] RDP ativo - pressione Ctrl+C para encerrar"
+              Write-Host "[$(Get-Date)] RDP ativo — aguardando até 46 horas..."
               Start-Sleep -Seconds 300
           }
