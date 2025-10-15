@@ -5,72 +5,116 @@ on:
 
 jobs:
   secure-rdp:
-    runs-on: windows-latest
-    timeout-minutes: 3600
+    # 4320 minutos = 72 horas (apenas para self-hosted runners)
+    runs-on: [self-hosted, windows, rdp]
+    timeout-minutes: 4320
 
     steps:
-      - name: Configurar as configurações principais do RDP
+      - name: 🔥 Limpeza Profunda do Sistema (preparar disco para jogos)
         run: |
-          # Habilita RDP e desativa a autenticação em nível de rede
+          Write-Host "==== Iniciando limpeza profunda ===="
+          # Parar serviços que podem travar arquivos
+          Stop-Service -Name wuauserv -ErrorAction SilentlyContinue
+          Stop-Service -Name bits -ErrorAction SilentlyContinue
+
+          $paths = @(
+            "C:\Program Files (x86)\Microsoft Visual Studio",
+            "C:\Program Files\Microsoft Visual Studio",
+            "C:\Program Files (x86)\Android",
+            "C:\Program Files\Android",
+            "C:\ProgramData\chocolatey",
+            "C:\Program Files\dotnet",
+            "C:\hostedtoolcache",
+            "C:\Users\runneradmin\AppData\Local\Temp",
+            "C:\Users\runneradmin\AppData\Local\Android",
+            "C:\Users\runneradmin\AppData\Local\NuGet",
+            "C:\Users\runneradmin\AppData\Roaming\npm",
+            "C:\Users\Public\Downloads"
+          )
+
+          foreach ($p in $paths) {
+              if (Test-Path $p) {
+                  Write-Host "Removendo $p ..."
+                  Remove-Item -Recurse -Force $p -ErrorAction SilentlyContinue
+              }
+          }
+
+          # Limpar pontos de restauração, hibernação e reduzir arquivos de paginação (opcional)
+          Write-Host "Desativando hibernação e limpando pontos de restauração..."
+          powercfg -h off
+          vssadmin delete shadows /all /quiet
+
+          # Truncar logs grandes (event logs)
+          wevtutil cl System || Write-Host "Não foi possível limpar System log"
+          wevtutil cl Application || Write-Host "Não foi possível limpar Application log"
+
+          # Liberar espaço no Windows temp + Recycle Bin
+          Remove-Item -Recurse -Force "$env:TEMP\*" -ErrorAction SilentlyContinue
+          Clear-RecycleBin -Force -ErrorAction SilentlyContinue
+
+          Write-Host "Espaço livre atual (C:):"
+          Get-PSDrive C
+
+          Write-Host "==== Limpeza concluída ===="
+
+      - name: ⚙️ Configurar RDP
+        run: |
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          netsh advfirewall firewall delete rule name="RDP-Allow" > $null 2>&1
+          netsh advfirewall firewall add rule name="RDP-Allow" dir=in action=allow protocol=TCP localport=3389
 
-          # Limpa regra antiga e adiciona nova no firewall
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
-
-          # Reinicia o serviço de RDP
           Restart-Service -Name TermService -Force
 
-      - name: Criar usuário RDP com senha segura
+      - name: 👤 Criar usuário RDP com senha segura
         run: |
           Add-Type -AssemblyName System.Security
-          $charSet = @{
-            Upper   = [char[]](65..90)    # A-Z
-            Lower   = [char[]](97..122)   # a-z
-            Number  = [char[]](48..57)    # 0-9
-            Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126)) # especiais
-          }
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $chars = ([char[]](33..126))
+          $password = -join ((1..20) | ForEach-Object { $chars | Get-Random })
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-          
-          if (-not (Get-LocalUser -Name "RDP")) {
-              Write-Error "Falha ao criar usuário RDP"
-              exit 1
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -Description "Conta RDP para jogos"
+          } else {
+              Write-Host "Usuário RDP já existe — atualizando senha..."
+              $user = Get-LocalUser -Name "RDP"
+              $user | Set-LocalUser -Password $securePass
           }
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
 
-      - name: Instalar Tailscale
+      - name: 🌀 Instalar Tailscale (opcional)
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
 
-      - name: Estabelecer conexão Tailscale
+      - name: 🌐 Conectar ao Tailscale (se usar)
         run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-          
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
+          if (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe") {
+              & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=rdp-selfhost-$env:GITHUB_RUN_ID
               $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
+              echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          } else {
+              Write-Host "Tailscale não encontrado — pulei essa etapa."
           }
-          
-          if (-not $tsIP) {
+
+      - name: ℹ️ Mostrar info de acesso
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "IP (Tailscale): $env:TAILSCALE_IP"
+          Write-Host "Usuário: RDP"
+          Write-Host "Senha: $env:RDP_PASSWORD"
+          Write-Host "==================`n"
+
+          # Mantém o job vivo até o timeout do workflow (4320 min)
+          while ($true) {
+              Write-Host "[$(Get-Date)] Sessão RDP ativa — aguardando 72h..."
+              Start-Sleep -Seconds 300
+          }          if (-not $tsIP) {
               Write-Error "Falha ao obter IP do Tailscale"
               exit 1
           }
